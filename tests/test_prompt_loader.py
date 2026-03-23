@@ -7,7 +7,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from auto_label_agent.utils.prompt_loader import DEFAULT_PROMPT_DIR, load_prompt_bundle
+from auto_label_agent.utils.prompt_loader import DEFAULT_PROMPT_FILE, load_prompt_bundle
 
 
 class PromptLoaderTest(unittest.TestCase):
@@ -18,8 +18,9 @@ class PromptLoaderTest(unittest.TestCase):
         self.assertTrue(bundle["scoring"])
         self.assertTrue(bundle["verify"])
 
-    def test_default_prompt_dir_exists(self) -> None:
-        self.assertTrue(DEFAULT_PROMPT_DIR.exists())
+    def test_default_prompt_file_exists(self) -> None:
+        self.assertTrue(DEFAULT_PROMPT_FILE.exists())
+        self.assertEqual(DEFAULT_PROMPT_FILE.name, "system_prompts.py")
 
 
 if __name__ == "__main__":

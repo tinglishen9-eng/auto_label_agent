@@ -2,7 +2,14 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from auto_label_agent.adapters.knowledge_base import KnowledgeChunk, LocalKnowledgeBase, OnlineKnowledgeBase
+from auto_label_agent.adapters.knowledge_base import (
+    KnowledgeChunk,
+    LocalKnowledgeBase,
+    MultiSourceKnowledgeBase,
+    OnlineKnowledgeBase,
+    WeiboSearchKnowledgeBase,
+    unique_keep_order,
+)
 from auto_label_agent.adapters.llm_client import LLMClient
 from auto_label_agent.utils.prompt_loader import load_prompt_bundle
 
@@ -37,17 +44,29 @@ class AutoLabelAgent:
         llm_client: LLMClient,
         local_kb: Optional[LocalKnowledgeBase] = None,
         online_kb_enabled: bool = False,
+        online_kb_provider: str = "duckduck",
         max_rounds: int = 3,
         kb_top_k: int = 3,
-        prompt_dir: Optional[str] = None,
+        prompt_file: Optional[str] = None,
     ):
         self.llm_client = llm_client
         self.local_kb = local_kb
         self.online_kb_enabled = online_kb_enabled
+        self.online_kb_provider = online_kb_provider
         self.max_rounds = max_rounds
         self.kb_top_k = kb_top_k
-        self.online_kb = OnlineKnowledgeBase() if online_kb_enabled else None
-        self.prompts = load_prompt_bundle(prompt_dir)
+        self.online_kb = self._build_online_kb() if online_kb_enabled else None
+        self.prompts = load_prompt_bundle(prompt_file)
+
+    def _build_online_kb(self):
+        provider = self.online_kb_provider.strip().lower()
+        if provider == "duckduck":
+            return OnlineKnowledgeBase()
+        if provider == "weibo_search":
+            return WeiboSearchKnowledgeBase()
+        if provider == "both":
+            return MultiSourceKnowledgeBase(["duckduck", "weibo_search"])
+        raise ValueError(f"不支持的 online_kb_provider={self.online_kb_provider}")
 
     def run(self, query: str, doc: str) -> AutoLabelResult:
         trace: List[AgentTrace] = []
@@ -151,6 +170,7 @@ doc:
             reason = issue.get("reason")
             if reason:
                 queries.append(str(reason))
+        queries = unique_keep_order(queries)
 
         collected: List[KnowledgeChunk] = []
         if self.local_kb is not None:
