@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import threading
 import traceback
@@ -9,6 +10,7 @@ from typing import Dict, Iterable, List, Sequence
 
 import requests
 
+logger = logging.getLogger(__name__)
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
 DEFAULT_ONLINE_KB_WORKERS = 3
@@ -118,6 +120,7 @@ class LocalKnowledgeBase:
 
     def search(self, queries: List[str], top_k: int = 3) -> List[KnowledgeChunk]:
         queries = unique_keep_order(queries)
+        logger.info("本地知识库检索: queries=%d, top_k=%d", len(queries), top_k)
         terms: List[str] = []
         for query in queries:
             terms.extend(tokenize(query))
@@ -202,6 +205,7 @@ class OnlineKnowledgeBase:
         if not deduped_queries:
             return []
 
+        logger.info("DuckDuckGo 检索: queries=%d, workers=%d", len(deduped_queries), self.max_workers)
         chunks: List[KnowledgeChunk] = [
             KnowledgeChunk(source="", title="", content="", score=0) for _ in deduped_queries
         ]
@@ -287,6 +291,7 @@ class WeiboSearchKnowledgeBase:
             return results
 
         worker_count = max(1, min(self.max_workers, len(mids)))
+        logger.info("微博搜索 HBase 拉取: mids=%d, workers=%d", len(mids), worker_count)
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_idx = {
                 executor.submit(self._get_hbase, mid): idx for idx, mid in enumerate(mids)
@@ -318,9 +323,11 @@ class WeiboSearchKnowledgeBase:
         if not deduped_queries:
             return []
 
+        logger.info("微博搜索知识检索: queries=%d, top_k=%d", len(deduped_queries), top_k)
         collected: List[KnowledgeChunk] = []
         for query in deduped_queries:
             mids = self._recall_mids(query, recall_size=max(top_k, 5))
+            logger.debug("query=%s recalled_mids=%d", query, len(mids))
             contents = self._get_hbase_batch(mids[: max(top_k, 5)])
             for idx, (mid, content) in enumerate(zip(mids, contents), start=1):
                 if not content:
@@ -360,6 +367,7 @@ class MultiSourceKnowledgeBase:
         if not deduped_queries:
             return []
 
+        logger.info("多知识源检索: providers=%s, queries=%d", ",".join(self.providers), len(deduped_queries))
         merged: List[KnowledgeChunk] = []
         for provider in self.providers:
             merged.extend(self._create_provider(provider).search(deduped_queries, top_k=top_k))

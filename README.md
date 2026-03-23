@@ -117,6 +117,19 @@ cd d:\微博\trae_test\auto_label_agent
 conda run -n base python run.py --help
 ```
 
+如果想看到更完整的日志和进度提示，可以加上：
+
+```bash
+conda run -n base python run.py --verbose ...
+```
+
+开启后会输出：
+
+- 当前运行配置
+- `需求理解 / 补充知识检索 / 相关性打分 / 二次验证` 的阶段进度
+- 本地知识库和在线知识源返回数量
+- 最终标签、验证结果和输出文件位置
+
 ## Prompt 配置
 
 默认会从 `src/auto_label_agent/prompts/system_prompts.py` 读取三段系统 prompt。你可以只改这一个文件，而不需要改 Python 逻辑代码。

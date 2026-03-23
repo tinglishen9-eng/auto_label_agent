@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,12 @@ from auto_label_agent.adapters.llm_client import (
 from auto_label_agent.core.pipeline import AutoLabelAgent
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 def read_text(text: str, file_path: str) -> str:
@@ -53,6 +60,7 @@ def build_local_kb(kb_file: str) -> Optional[LocalKnowledgeBase]:
 @click.option("--max-rounds", default=3, type=int, help="最多自校验迭代轮数")
 @click.option("--prompt-file", default="", help="自定义单文件 prompt 配置，需包含 intent/scoring/verify 3 个字段")
 @click.option("--output", default="", help="将最终结果写入 JSON 文件")
+@click.option("--verbose/--no-verbose", default=False, help="是否输出更详细的调试日志")
 def main(
     provider: str,
     model: str,
@@ -69,7 +77,11 @@ def main(
     max_rounds: int,
     prompt_file: str,
     output: str,
+    verbose: bool,
 ) -> None:
+    setup_logging(verbose)
+    logger.info("启动自动标注 Agent")
+
     query_text = read_text(query, query_file)
     doc_text = read_text(doc, doc_file)
 
@@ -84,10 +96,22 @@ def main(
             f"缺少 API Key，请在环境变量或 .env 中配置 {provider.upper()}_API_KEY。"
         )
 
+    resolved_endpoint = resolve_endpoint(provider, endpoint)
+    logger.info(
+        "运行配置: provider=%s, model=%s, online_kb=%s, online_kb_provider=%s, local_kb=%s",
+        provider,
+        model,
+        online_kb,
+        online_kb_provider,
+        bool(kb_file),
+    )
+    logger.debug("endpoint=%s, prompt_file=%s, output=%s", resolved_endpoint, prompt_file or "<default>", output or "<stdout>")
+    logger.info("样本长度: query=%d, doc=%d", len(query_text), len(doc_text))
+
     client = LLMClient(
         provider=provider,
         model=model,
-        endpoint=resolve_endpoint(provider, endpoint),
+        endpoint=resolved_endpoint,
         api_key=api_key,
         temperature=temperature,
     )
@@ -101,7 +125,14 @@ def main(
         prompt_file=prompt_file or None,
     )
 
+    logger.info("开始执行标注流程")
     result = agent.run(query=query_text, doc=doc_text)
+    logger.info(
+        "标注完成: label=%s, verification_passed=%s, final_action=%s",
+        result.label,
+        result.verification_passed,
+        result.final_action,
+    )
     payload = {
         "query": query_text,
         "doc": doc_text,
@@ -122,4 +153,5 @@ def main(
 
     if output:
         Path(output).write_text(output_text, encoding="utf-8")
+        logger.info("结果已写入 %s", os.path.abspath(output))
         click.echo(f"\n结果已写入: {os.path.abspath(output)}")

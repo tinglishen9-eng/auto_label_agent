@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -12,6 +13,8 @@ from auto_label_agent.adapters.knowledge_base import (
 )
 from auto_label_agent.adapters.llm_client import LLMClient
 from auto_label_agent.utils.prompt_loader import load_prompt_bundle
+
+logger = logging.getLogger(__name__)
 
 
 def pretty_json(data: object) -> str:
@@ -60,6 +63,7 @@ class AutoLabelAgent:
 
     def _build_online_kb(self):
         provider = self.online_kb_provider.strip().lower()
+        logger.debug("初始化在线知识源: %s", provider)
         if provider == "duckduck":
             return OnlineKnowledgeBase()
         if provider == "weibo_search":
@@ -78,27 +82,39 @@ class AutoLabelAgent:
         latest_verification: Dict[str, object] = {}
 
         for round_id in range(1, self.max_rounds + 1):
+            logger.info("[%d/%d] 需求理解", round_id, self.max_rounds)
             latest_intent = self._understand_intent(query, doc, intent_feedback, used_knowledge)
             trace.append(AgentTrace(step=f"round_{round_id}_intent", payload=latest_intent))
+            logger.debug("intent=%s", pretty_json(latest_intent))
 
             if latest_intent.get("should_use_kb"):
+                logger.info("[%d/%d] 补充知识检索", round_id, self.max_rounds)
                 used_knowledge = self._retrieve_knowledge(query, latest_intent)
+                logger.info("检索到 %d 条补充知识", len(used_knowledge))
                 trace.append(
                     AgentTrace(
                         step=f"round_{round_id}_knowledge",
                         payload={"items": [item.to_dict() for item in used_knowledge]},
                     )
                 )
+                logger.info("[%d/%d] 基于补充知识重新理解需求", round_id, self.max_rounds)
                 latest_intent = self._understand_intent(query, doc, intent_feedback, used_knowledge)
                 trace.append(AgentTrace(step=f"round_{round_id}_intent_refined", payload=latest_intent))
+                logger.debug("intent_refined=%s", pretty_json(latest_intent))
 
+            logger.info("[%d/%d] 相关性打分", round_id, self.max_rounds)
             latest_score = self._score_relevance(query, doc, latest_intent, used_knowledge, score_feedback)
             trace.append(AgentTrace(step=f"round_{round_id}_score", payload=latest_score))
+            logger.info("当前标签: %s", latest_score.get("label"))
+            logger.debug("score=%s", pretty_json(latest_score))
 
+            logger.info("[%d/%d] 二次验证", round_id, self.max_rounds)
             latest_verification = self._verify(query, doc, latest_intent, latest_score, used_knowledge)
             trace.append(AgentTrace(step=f"round_{round_id}_verify", payload=latest_verification))
+            logger.debug("verification=%s", pretty_json(latest_verification))
 
             if latest_verification.get("passed") and latest_verification.get("final_action") == "finish":
+                logger.info("验证通过，流程结束")
                 break
 
             action = latest_verification.get("final_action") or "rescore"
@@ -106,6 +122,7 @@ class AutoLabelAgent:
             reasons = "；".join(
                 issue.get("reason", "") for issue in issues if isinstance(issue, dict) and issue.get("reason")
             )
+            logger.warning("验证未通过: action=%s, reasons=%s", action, reasons or "<none>")
             if action == "revisit_intent":
                 intent_feedback = f"质检未通过，请重点修正这些理解问题：{reasons}"
                 continue
@@ -119,6 +136,7 @@ class AutoLabelAgent:
                         payload={"items": [item.to_dict() for item in used_knowledge]},
                     )
                 )
+                logger.info("重检索后得到 %d 条补充知识", len(used_knowledge))
                 continue
             score_feedback = f"质检未通过，请重新审视标签，问题如下：{reasons}"
 
@@ -171,12 +189,17 @@ doc:
             if reason:
                 queries.append(str(reason))
         queries = unique_keep_order(queries)
+        logger.debug("knowledge_queries=%s", queries)
 
         collected: List[KnowledgeChunk] = []
         if self.local_kb is not None:
-            collected.extend(self.local_kb.search(queries, top_k=self.kb_top_k))
+            local_results = self.local_kb.search(queries, top_k=self.kb_top_k)
+            collected.extend(local_results)
+            logger.info("本地知识库返回 %d 条结果", len(local_results))
         if self.online_kb is not None:
-            collected.extend(self.online_kb.search(queries, top_k=self.kb_top_k))
+            online_results = self.online_kb.search(queries, top_k=self.kb_top_k)
+            collected.extend(online_results)
+            logger.info("在线知识源返回 %d 条结果", len(online_results))
 
         collected.sort(key=lambda item: item.score, reverse=True)
         return collected[: self.kb_top_k]

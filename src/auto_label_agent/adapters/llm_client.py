@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from typing import Any, Dict
 
 import requests
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINTS: Dict[str, str] = {
     "deepseek": "https://api.deepseek.com/chat/completions",
@@ -16,7 +18,6 @@ DEFAULT_ENDPOINTS: Dict[str, str] = {
     "weibo_proxy": "http://mproxy.search.weibo.com/llm/generate",
 }
 
-
 PROVIDER_API_KEY_ENV: Dict[str, tuple[str, ...]] = {
     "deepseek": ("DEEPSEEK_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
@@ -25,7 +26,6 @@ PROVIDER_API_KEY_ENV: Dict[str, tuple[str, ...]] = {
     "mproxy": (),
     "weibo_proxy": (),
 }
-
 
 PROVIDERS_WITHOUT_API_KEY = {"mproxy", "weibo_proxy"}
 
@@ -128,6 +128,7 @@ class LLMClient:
     sid: str = "comprehensive_search_yybz"
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> Any:
+        logger.info("调用模型进行 JSON 输出: provider=%s, model=%s", self.provider, self.model)
         if self._is_proxy_provider():
             message = self._complete_proxy_text(system_prompt, user_prompt)
             return extract_json_block(message)
@@ -148,6 +149,7 @@ class LLMClient:
         return extract_json_block(message)
 
     def complete_text(self, system_prompt: str, user_prompt: str) -> str:
+        logger.info("调用模型生成文本: provider=%s, model=%s", self.provider, self.model)
         if self._is_proxy_provider():
             return self._complete_proxy_text(system_prompt, user_prompt)
 
@@ -182,6 +184,8 @@ class LLMClient:
             "sid": self.sid,
             "model": self.model,
         }
+        logger.info("调用自定义代理模型: sid=%s, model=%s", self.sid, self.model)
+        logger.debug("proxy_endpoint=%s", self.endpoint)
         response = requests.post(self.endpoint, json=payload, timeout=self.timeout)
         response.raise_for_status()
         response_data = response.json()
@@ -195,6 +199,7 @@ class LLMClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        logger.debug("request_endpoint=%s", self.endpoint)
         response = requests.post(
             self.endpoint,
             json=payload,
@@ -204,6 +209,7 @@ class LLMClient:
         if response.status_code < 400:
             return response
 
+        logger.warning("模型请求返回非 2xx，尝试回退 response_format: status=%s", response.status_code)
         if "response_format" not in payload:
             response.raise_for_status()
             return response
