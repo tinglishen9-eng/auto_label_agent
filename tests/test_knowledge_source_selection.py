@@ -20,6 +20,34 @@ class KnowledgeSourceSelectionTest(unittest.TestCase):
         kb = MultiSourceKnowledgeBase(["weibo_search", "duckduck", "weibo_search"])
         self.assertEqual(kb.providers, ["weibo_search", "duckduck"])
 
+    def test_multi_source_supports_weibo_llm(self) -> None:
+        kb = MultiSourceKnowledgeBase(["weibo_llm", "duckduck", "weibo_llm"])
+        self.assertEqual(kb.providers, ["weibo_llm", "duckduck"])
+
+    def test_agent_supports_weibo_llm_online_kb_provider(self) -> None:
+        agent = AutoLabelAgent(
+            llm_client=None,  # type: ignore[arg-type]
+            online_kb_enabled=True,
+            online_kb_provider="weibo_llm",
+        )
+        self.assertIsNotNone(agent.online_kb)
+
+    def test_agent_supports_all_online_kb_provider(self) -> None:
+        agent = AutoLabelAgent(
+            llm_client=None,  # type: ignore[arg-type]
+            online_kb_enabled=True,
+            online_kb_provider="all",
+        )
+        self.assertEqual(agent.online_kb.providers, ["duckduck", "weibo_search", "weibo_llm"])  # type: ignore[union-attr]
+
+    def test_both_now_includes_weibo_llm(self) -> None:
+        agent = AutoLabelAgent(
+            llm_client=None,  # type: ignore[arg-type]
+            online_kb_enabled=True,
+            online_kb_provider="both",
+        )
+        self.assertEqual(agent.online_kb.providers, ["duckduck", "weibo_search", "weibo_llm"])  # type: ignore[union-attr]
+
     def test_agent_rejects_unknown_online_kb_provider(self) -> None:
         with self.assertRaises(ValueError):
             AutoLabelAgent(

@@ -6,7 +6,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
+from urllib.parse import urlencode
 
 import requests
 
@@ -15,10 +16,11 @@ logger = logging.getLogger(__name__)
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
 DEFAULT_ONLINE_KB_WORKERS = 3
 DEFAULT_WEIBO_KB_WORKERS = 8
+DEFAULT_WEIBO_LLM_KB_WORKERS = 3
 WEIBO_AC_URL = (
     "http://i.search.weibo.com/search/libac.php"
-    "?ip=10.54.34.27&port=20012&sid=weibo_search_ac&sid_group=mobile"
-    "&key={query}&print_more_aclog=1&jx_cuid=3706102772&abtest=1163933937"
+    "?ip=10.185.70.62&port=20012&sid=weibo_search_ac&sid_group=mobile"
+    "&key={query}&print_more_aclog=0&jx_cuid=3706102772&abtest=1163933937"
     "&num=15&xsort=hot&us=1&req_source_project=mi&dup=1&social_starttime=0"
     "&bubble_request=0&interaction_time=60&request_red_dot=0&post_top_limit=0"
     "&is_scroll=0&socialtime=1&isbctruncate=1&trace=2&t=0&is_media_request=0"
@@ -26,6 +28,7 @@ WEIBO_AC_URL = (
     "&hot_review_page=0"
 )
 WEIBO_HBASE_URL = "http://getdata.search.weibo.com/getdata/querydata.php?condition={mid}&mode=weibo&format=json"
+WEIBO_LLM_ANALYSIS_URL = "http://admin.ai.s.weibo.com/api/llm/analysis_result.json"
 _thread_local = threading.local()
 
 
@@ -224,37 +227,59 @@ class WeiboSearchKnowledgeBase:
     def __init__(self, max_workers: int = DEFAULT_WEIBO_KB_WORKERS):
         self.max_workers = max_workers
 
-    def _func_bs_score(self, query: str) -> tuple[Dict[str, List[int]], Dict[str, List[int]]]:
-        keywords_list: Dict[str, List[int]] = {}
-        vec_list: Dict[str, List[int]] = {}
+    def _extract_recall_text(self, item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        parts: List[str] = []
+        for key in ("screen_name", "nick", "nickname", "name", "title", "text", "desc", "content"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        for nested_key in ("user", "card", "item"):
+            nested = item.get(nested_key)
+            if isinstance(nested, dict):
+                for key in ("screen_name", "nick", "nickname", "name", "title", "text", "desc", "content"):
+                    value = nested.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value.strip())
+        return " | ".join(unique_keep_order(parts))
+
+    def _recall_items(self, query: str, recall_size: int) -> List[Dict[str, str]]:
         count = 0
         while count < 3:
             try:
                 response = get_session().get(WEIBO_AC_URL.format(query=query), timeout=10)
                 response.raise_for_status()
                 res = response.json()
-                aclog = res["sp"]["aclog"]
-                lidx = aclog.find("bs_score")
-                ridx = aclog.rfind("bs_score")
-                if lidx < 0 or ridx < 0:
-                    return keywords_list, vec_list
-
-                for value in aclog[lidx - 1:ridx + 100].split("] ["):
-                    try:
-                        mid, score, bcidx, _query_idx = value.split(",")[:4]
-                        mid = mid.split(":")[-1]
-                        total_score = score[:4]
-                        vec_score = score[-2:]
-                        bcidx_value = int(bcidx.split(":")[-1])
-                        target = vec_list if bcidx_value in [15, 16, 18, 20] else keywords_list
-                        target[mid] = [int(total_score), int(vec_score)]
-                    except Exception:
-                        traceback.print_exc()
-                return keywords_list, vec_list
+                result = res.get("sp", {}).get("result") or []
+                items: List[Dict[str, str]] = []
+                for item in result:
+                    if not isinstance(item, dict):
+                        continue
+                    mid = str(item.get("ID") or "").strip()
+                    if mid:
+                        items.append(
+                            {
+                                "mid": mid,
+                                "text": self._extract_recall_text(item),
+                            }
+                        )
+                    if len(items) >= recall_size:
+                        break
+                deduped: List[Dict[str, str]] = []
+                seen = set()
+                for item in items:
+                    mid = item["mid"]
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    deduped.append(item)
+                logger.debug("weibo_search recall query=%s mids=%s", query, [item["mid"] for item in deduped])
+                return deduped
             except Exception:
                 count += 1
                 traceback.print_exc()
-        return keywords_list, vec_list
+        return []
 
     def _get_hbase(self, mid: str):
         count = 0
@@ -305,19 +330,6 @@ class WeiboSearchKnowledgeBase:
                     results[idx] = None
         return results
 
-    def _recall_mids(self, query: str, recall_size: int) -> List[str]:
-        keyword_scores, vec_scores = self._func_bs_score(query)
-        if not keyword_scores and not vec_scores:
-            return []
-
-        v_score_recall = sorted(vec_scores.items(), key=lambda x: x[1][1], reverse=True)[:recall_size]
-        t_score_recall = sorted(vec_scores.items(), key=lambda x: x[1][0], reverse=True)[:recall_size]
-        w_score_recall = sorted(keyword_scores.items(), key=lambda x: x[1][0], reverse=True)[:recall_size]
-        mids = [item[0] for item in v_score_recall]
-        mids.extend(item[0] for item in t_score_recall)
-        mids.extend(item[0] for item in w_score_recall)
-        return unique_keep_order(mids)
-
     def search(self, queries: List[str], top_k: int = 3) -> List[KnowledgeChunk]:
         deduped_queries = unique_keep_order(queries)
         if not deduped_queries:
@@ -326,23 +338,134 @@ class WeiboSearchKnowledgeBase:
         logger.info("微博搜索知识检索: queries=%d, top_k=%d", len(deduped_queries), top_k)
         collected: List[KnowledgeChunk] = []
         for query in deduped_queries:
-            mids = self._recall_mids(query, recall_size=max(top_k, 5))
+            recall_items = self._recall_items(query, recall_size=max(top_k, 5))
+            mids = [item["mid"] for item in recall_items]
             logger.debug("query=%s recalled_mids=%d", query, len(mids))
             contents = self._get_hbase_batch(mids[: max(top_k, 5)])
-            for idx, (mid, content) in enumerate(zip(mids, contents), start=1):
-                if not content:
+            for idx, ((mid, recall_item), content) in enumerate(zip(zip(mids, recall_items), contents), start=1):
+                final_content = content or recall_item.get("text") or ""
+                if not final_content:
+                    logger.debug("query=%s mid=%s 未拿到 hbase 内容，也没有召回兜底文本", query, mid)
                     continue
+                if not content:
+                    logger.debug("query=%s mid=%s hbase 为空，使用召回结果文本兜底", query, mid)
                 collected.append(
                     KnowledgeChunk(
                         source="weibo_search",
                         title=f"{query}-mid-{mid}",
-                        content=content,
+                        content=final_content,
                         score=max(top_k - idx + 1, 1),
                     )
                 )
 
         collected.sort(key=lambda item: item.score, reverse=True)
         return collected[:top_k]
+
+
+class WeiboLLMKnowledgeBase:
+    DEFAULT_CH_TYPE = "ori_data_type"
+    DEFAULT_FILTER_TAG = "30"
+    REQUEST_TIMEOUT = 5
+
+    def __init__(
+        self,
+        max_workers: int = DEFAULT_WEIBO_LLM_KB_WORKERS,
+        ch_type: str = DEFAULT_CH_TYPE,
+        filter_tag: str = DEFAULT_FILTER_TAG,
+        request_timeout: int = REQUEST_TIMEOUT,
+    ):
+        self.max_workers = max_workers
+        self.ch_type = ch_type
+        self.filter_tag = filter_tag
+        self.request_timeout = request_timeout
+
+    def _build_url(self, query: str) -> str:
+        params = {
+            "query": query,
+            "ch_type": self.ch_type,
+            "filter_tag": self.filter_tag,
+        }
+        return f"{WEIBO_LLM_ANALYSIS_URL}?{urlencode(params)}"
+
+    def _extract_content(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            logger.error("微博 LLM 知识接口返回结构异常: %s", type(payload))
+            return ""
+        for key in ("deepseek", "deepseek_stream", "preview"):
+            item = data.get(key)
+            if isinstance(item, dict):
+                content = str(item.get("content") or "").strip()
+                if content:
+                    return content
+        logger.error("微博 LLM 知识接口未命中预期字段，data keys=%s", list(data.keys()))
+        return ""
+
+    def _search_one(self, query: str) -> KnowledgeChunk:
+        url = self._build_url(query)
+        try:
+            response = get_session().get(
+                WEIBO_LLM_ANALYSIS_URL,
+                params={
+                    "query": query,
+                    "ch_type": self.ch_type,
+                    "filter_tag": self.filter_tag,
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=self.request_timeout,
+            )
+            if response.status_code != 200:
+                logger.error("微博 LLM 知识接口状态码异常: status=%s, query=%s", response.status_code, query)
+                return KnowledgeChunk(
+                    source="weibo_llm",
+                    title=query,
+                    content=f"检索失败: HTTP {response.status_code}",
+                    score=0,
+                )
+            payload = response.json()
+            content = self._extract_content(payload)
+            if not content:
+                return KnowledgeChunk(
+                    source="weibo_llm",
+                    title=query,
+                    content="无明显补充信息。",
+                    score=0,
+                )
+            return KnowledgeChunk(
+                source="weibo_llm",
+                title=query,
+                content=content,
+                score=max(1, len(content) // 80),
+            )
+        except Exception as exc:
+            logger.error("微博 LLM 知识接口请求失败: query=%s, error=%s, url=%s", query, exc, url)
+            return KnowledgeChunk(
+                source="weibo_llm",
+                title=query,
+                content=f"检索失败: {exc}",
+                score=0,
+            )
+
+    def search(self, queries: List[str], top_k: int = 3) -> List[KnowledgeChunk]:
+        deduped_queries = unique_keep_order(queries)[:top_k]
+        if not deduped_queries:
+            return []
+        logger.info("微博 LLM 知识检索: queries=%d, workers=%d", len(deduped_queries), self.max_workers)
+        chunks: List[KnowledgeChunk] = [
+            KnowledgeChunk(source="", title="", content="", score=0) for _ in deduped_queries
+        ]
+        worker_count = max(1, min(self.max_workers, len(deduped_queries)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_idx = {
+                executor.submit(self._search_one, query): idx for idx, query in enumerate(deduped_queries)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                chunks[idx] = future.result()
+        chunks.sort(key=lambda item: item.score, reverse=True)
+        return chunks[:top_k]
 
 
 class MultiSourceKnowledgeBase:
@@ -360,6 +483,8 @@ class MultiSourceKnowledgeBase:
             return OnlineKnowledgeBase()
         if provider == "weibo_search":
             return WeiboSearchKnowledgeBase()
+        if provider == "weibo_llm":
+            return WeiboLLMKnowledgeBase()
         raise ValueError(f"不支持的知识源 provider={provider}")
 
     def search(self, queries: List[str], top_k: int = 3) -> List[KnowledgeChunk]:
